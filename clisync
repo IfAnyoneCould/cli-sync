@@ -1,0 +1,211 @@
+#!/usr/bin/env bash
+# keeps wsl's cli setup matched to windows. windows is the source of truth,
+# configs get symlinked and tools get pinned to whatever version scoop has
+set -euo pipefail
+
+WIN=${CLISYNC_WIN:-$(wslpath "$(cd /mnt/c && cmd.exe /c 'echo %USERPROFILE%' 2>/dev/null | tr -d '\r')")}
+WC=$WIN/.claude
+
+# scoop name -> mise name. anything not in here stays windows only
+declare -A TOOLS=(
+  [neovim]=neovim [yazi]=yazi [oh-my-posh]=oh-my-posh [fzf]=fzf [fd]=fd
+  [ripgrep]=ripgrep [lazygit]=lazygit [zoxide]=zoxide [jq]=jq [gh]=gh
+  [glow]=glow [btop]=btop [go]=go [lua-language-server]=lua-language-server
+  [fastfetch]=fastfetch [7zip]=7zip
+)
+# not in scoop but wsl needs them (node on windows is the installer version)
+EXTRA=(node@lts npm:pyright@latest tree-sitter@latest)
+
+say() { printf '\033[34m::\033[0m %s\n' "$*"; }
+warn() { printf '\033[33m!!\033[0m %s\n' "$*" >&2; }
+
+link() {
+  local src=$1 dst=$2
+  [ -e "$src" ] || return 0
+  if [ -L "$dst" ]; then
+    [ "$(readlink "$dst")" = "$src" ] && return 0
+    rm "$dst"
+  elif [ -e "$dst" ]; then
+    mv "$dst" "$dst.bak.$(date +%s)"
+    warn "moved old $dst to $dst.bak.*"
+  fi
+  mkdir -p "$(dirname "$dst")"
+  ln -s "$src" "$dst"
+  say "linked $dst"
+}
+
+# same as link but anything already on the wsl side gets moved over first
+merge_link() {
+  local src=$1 dst=$2
+  if [ -d "$dst" ] && [ ! -L "$dst" ]; then
+    mkdir -p "$src"
+    cp -rn "$dst"/. "$src"/
+    rm -rf "$dst"
+  fi
+  link "$src" "$dst"
+}
+
+# replaces the block between the markers in a file
+block() {
+  local file=$1 body=$2
+  touch "$file"
+  sed -i '/^# >>> clisync >>>$/,/^# <<< clisync <<<$/d' "$file"
+  printf '# >>> clisync >>>\n%s\n# <<< clisync <<<\n' "$body" >> "$file"
+}
+
+configs() {
+  link "$WIN/AppData/Local/nvim" ~/.config/nvim
+  link "$WIN/AppData/Roaming/yazi/config" ~/.config/yazi
+  link "$WIN/.ohmyposhconfigs" ~/.config/ohmyposh
+  link "$WIN/AppData/Roaming/lazygit" ~/.config/lazygit
+  link "$WIN/.config/fastfetch" ~/.config/fastfetch
+
+  # prompt comes from whatever the pwsh profile uses
+  local prof theme init=""
+  prof=$(ls "$WIN"/Documents/PowerShell/Microsoft.PowerShell_profile.ps1 2>/dev/null || true)
+  if [ -n "$prof" ]; then
+    theme=$(tr -d '\r' < "$prof" | grep -m1 '^oh-my-posh init' | sed -E 's/.*--config +([^ |]+).*/\1/')
+    case $theme in
+      '') ;;
+      http*) init="eval \"\$(oh-my-posh init bash --config $theme)\"" ;;
+      *) init="eval \"\$(oh-my-posh init bash --config ~/.config/ohmyposh/${theme##*[\\/]})\"" ;;
+    esac
+    grep -q '^[^#]*zoxide init' "$prof" && init+=$'\neval "$(zoxide init bash)"'
+  fi
+  # the old hand written prompt line would run twice otherwise
+  sed -i '/^eval "$(oh-my-posh init bash/d' ~/.bashrc
+  block ~/.bashrc "$init"
+}
+
+git_setup() {
+  local gcm="/mnt/c/Program Files/Git/mingw64/bin/git-credential-manager.exe"
+  if [ -f ~/.gitconfig ] && ! grep -q '^# clisync' ~/.gitconfig; then
+    warn "~/.gitconfig isn't mine, leaving it"
+    return
+  fi
+  {
+    echo "# clisync, edit $WIN/.gitconfig instead"
+    printf '[include]\n\tpath = %s/.gitconfig\n' "$WIN"
+    # stops every windows checkout showing as modified
+    printf '[core]\n\tautocrlf = input\n'
+    [ -f "$gcm" ] && printf '[credential]\n\thelper = "%s"\n' "$gcm"
+  } > ~/.gitconfig
+  say "wrote ~/.gitconfig"
+}
+
+# ssh won't use keys with windows permissions so these get copied, not linked
+ssh_setup() {
+  [ -d "$WIN/.ssh" ] || return 0
+  mkdir -p ~/.ssh && chmod 700 ~/.ssh
+  local f
+  for f in "$WIN"/.ssh/*; do
+    [ -f "$f" ] || continue
+    case $f in *.old) continue ;; esac
+    cp -u "$f" ~/.ssh/
+    case $f in *.pub|*known_hosts*) chmod 644 ~/.ssh/"${f##*/}" ;; *) chmod 600 ~/.ssh/"${f##*/}" ;; esac
+  done
+}
+
+claude_setup() {
+  [ -d "$WC" ] || return 0
+  local f
+  for f in settings.json settings.local.json CLAUDE.md keybindings.json skills agents commands output-styles; do
+    link "$WC/$f" ~/.claude/"$f"
+  done
+
+  # memory is per project. C--Users-JonahW-x on windows is -mnt-c-Users-JonahW-x here
+  local d key
+  for d in "$WC"/projects/*/memory; do
+    [ -d "$d" ] || continue
+    key=$(basename "$(dirname "$d")")
+    [[ $key =~ ^([A-Za-z])-(.*)$ ]] || continue
+    merge_link "$d" ~/.claude/projects/"-mnt-${BASH_REMATCH[1],,}${BASH_REMATCH[2]}"/memory
+  done
+
+  # plugin installs store windows paths so reinstall whatever's enabled
+  local have p
+  have=$(claude plugin list 2>/dev/null || true)
+  for p in $(python3 -c "import json,sys; [print(k) for k,v in json.load(open(sys.argv[1])).get('enabledPlugins',{}).items() if v]" "$WC/settings.json"); do
+    grep -q "${p%@*}" <<< "$have" && continue
+    say "installing claude plugin $p"
+    claude plugin install "$p" >/dev/null || warn "couldn't install $p"
+  done
+}
+
+scoop_apps() {
+  powershell.exe -NoProfile -c "scoop export" 2>/dev/null | tr -d '\r' |
+    python3 -c "import json,sys; [print(a['Name'], a['Version']) for a in json.load(sys.stdin)['apps']]"
+}
+
+tools() {
+  local specs=() name ver m
+  while read -r name ver; do
+    m=${TOOLS[$name]:-}
+    [ -n "$m" ] || continue
+    # scoop can be a day or two ahead of what mise will hand out
+    if mise ls-remote "$m" 2>/dev/null | grep -qxF "$ver"; then
+      specs+=("$m@$ver")
+    else
+      warn "$m $ver isn't on mise yet, using latest"
+      specs+=("$m@latest")
+    fi
+  done < <(scoop_apps)
+  specs+=("${EXTRA[@]}")
+  say "pinning ${#specs[@]} tools"
+  mise use -g "${specs[@]}"
+  mise upgrade >/dev/null
+}
+
+nvim_setup() {
+  command -v nvim >/dev/null || return 0
+  local lock=$WIN/AppData/Local/nvim/lazy-lock.json old
+  old=$(mktemp)
+  cp "$lock" "$old"
+  say "restoring nvim plugins to lazy-lock.json"
+  (cd /tmp && nvim --headless "+Lazy! restore" \
+    +"lua local ts=require('nvim-treesitter') ts.install(ts.get_installed()):wait(300000)" +qa >/dev/null 2>&1) ||
+    warn "nvim restore failed, run :Lazy restore by hand"
+  # lazy rewrites the lock with LF, put the old one back if thats all that changed
+  diff -q --strip-trailing-cr "$old" "$lock" >/dev/null && cp "$old" "$lock"
+  rm -f "$old"
+}
+
+status() {
+  local d
+  for d in nvim yazi ohmyposh lazygit fastfetch; do
+    printf '%-12s %s\n' "$d" "$(readlink ~/.config/$d || echo 'not linked')"
+  done
+  echo
+  local name ver m cur
+  while read -r name ver; do
+    m=${TOOLS[$name]:-}
+    [ -n "$m" ] || continue
+    cur=$(mise current "$m" 2>/dev/null || true)
+    [ "$cur" = "$ver" ] && printf '%-22s %s\n' "$m" "$ver" || printf '%-22s \033[33m%s (windows %s)\033[0m\n' "$m" "${cur:-missing}" "$ver"
+  done < <(scoop_apps)
+}
+
+sync() {
+  configs
+  git_setup
+  ssh_setup
+  tools
+  # mise's paths aren't in this shell yet
+  eval "$(mise activate bash --shims)"
+  claude_setup
+  nvim_setup
+  say "done, open a new shell"
+}
+
+case ${1:-sync} in
+  sync) sync ;;
+  update)
+    say "updating scoop"
+    powershell.exe -NoProfile -c "scoop update; scoop update *"
+    sync
+    ;;
+  status) status ;;
+  configs) configs; git_setup; ssh_setup; claude_setup ;;
+  tools) tools ;;
+  *) echo "usage: clisync [sync|update|status|configs|tools]"; exit 1 ;;
+esac
