@@ -11,10 +11,11 @@ declare -A TOOLS=(
   [neovim]=neovim [yazi]=yazi [oh-my-posh]=oh-my-posh [fzf]=fzf [fd]=fd
   [ripgrep]=ripgrep [lazygit]=lazygit [zoxide]=zoxide [jq]=jq [gh]=gh
   [glow]=glow [go]=go [lua-language-server]=lua-language-server
-  [fastfetch]=fastfetch [7zip]=7zip [scc]=aqua:boyter/scc
+  [fastfetch]=fastfetch [7zip]=7zip [scc]=aqua:boyter/scc [python]=python
+  [postgresql]=postgres [maven]=maven
 )
-# not in scoop but wsl needs them (node on windows is the installer version)
-EXTRA=(node@lts npm:pyright@latest tree-sitter@latest)
+# not in scoop but wsl needs them (node and java on windows are the installer versions)
+EXTRA=(node@lts java@24 npm:pyright@latest tree-sitter@latest)
 
 say() { printf '\033[34m::\033[0m %s\n' "$*"; }
 warn() { printf '\033[33m!!\033[0m %s\n' "$*" >&2; }
