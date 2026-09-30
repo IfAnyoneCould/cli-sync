@@ -10,7 +10,7 @@ WC=$WIN/.claude
 declare -A TOOLS=(
   [neovim]=neovim [yazi]=yazi [oh-my-posh]=oh-my-posh [fzf]=fzf [fd]=fd
   [ripgrep]=ripgrep [lazygit]=lazygit [zoxide]=zoxide [jq]=jq [gh]=gh
-  [glow]=glow [btop]=btop [go]=go [lua-language-server]=lua-language-server
+  [glow]=glow [go]=go [lua-language-server]=lua-language-server
   [fastfetch]=fastfetch [7zip]=7zip [scc]=aqua:boyter/scc
 )
 # not in scoop but wsl needs them (node on windows is the installer version)
